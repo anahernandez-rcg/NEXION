@@ -247,24 +247,29 @@ tr:hover td{background:var(--surface2)}
           Sign in with Microsoft
         </button>
       </div>
+      <div id="auth-delegate-status" style="font-size:11px;color:var(--muted);margin-top:10px;min-height:16px;text-align:center"></div>
     </div>
 
     <!-- SERVICE PRINCIPAL (needs proxy warning) -->
     <div id="auth-pane-sp" style="display:none">
-      <div style="background:var(--amber)10;border:1px solid var(--amber)40;border-radius:8px;padding:12px;margin-bottom:14px;font-size:11px;color:var(--amber)">
-        <b>⚠ Security note:</b> Service principal client secrets must never be sent from a browser. This mode requires a backend proxy that holds the secret server-side.
+      <div style="background:var(--amber)10;border:1px solid var(--amber)40;border-radius:8px;padding:12px;margin-bottom:14px;font-size:11px;color:var(--text2);line-height:1.7">
+        <b style="color:var(--amber)">⚠ Before connecting</b> — your Azure Function needs CORS enabled:<br>
+        1. Azure Portal → your Function App → <b>CORS</b><br>
+        2. Add <code style="background:var(--surface2);padding:1px 5px;border-radius:3px;font-size:10px" id="cors-origin-hint">your page origin</code> (or <code style="background:var(--surface2);padding:1px 5px;border-radius:3px;font-size:10px">*</code> for testing)<br>
+        3. Check <b>Enable Access-Control-Allow-Credentials</b> → Save
       </div>
       <div class="field"><label>TENANT ID</label><input id="inp-tenant" placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"/></div>
       <div class="field"><label>CLIENT ID</label><input id="inp-client" placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"/></div>
       <div class="field">
         <label>PROXY BASE URL</label>
-        <input id="inp-proxy" placeholder="https://nexion-api.azurewebsites.net"/>
-        <div class="hint">Your backend proxy must expose POST /api/token and forward PBI calls with the Bearer token.</div>
+        <input id="inp-proxy" placeholder="https://your-function-app.azurewebsites.net"/>
+        <div class="hint">Azure Function URL — no trailing slash. Function must be named <b>token</b> and accept POST /api/token</div>
       </div>
       <div class="modal-actions">
         <button class="btn-cancel" onclick="skipConnect()">Skip — use demo data</button>
         <button class="btn-primary" onclick="connectServicePrincipal()">Connect via Proxy</button>
       </div>
+      <div id="proxy-status" style="font-size:11px;color:var(--muted);margin-top:10px;min-height:16px;line-height:1.6"></div>
     </div>
   </div>
 </div>
@@ -1521,34 +1526,63 @@ function connectInteractive(){
   var tenantId=(document.getElementById('inp-tenant-delegate').value||'').trim()||'common';
   if(!clientId){alert('Please enter your App (Client) ID.');return;}
   creds.tenant=tenantId; creds.client=clientId;
+
   var btn=document.querySelector('#auth-pane-delegate .btn-primary');
-  if(btn){btn.disabled=true;btn.textContent='Loading MSAL\u2026';}
+  var statusEl=document.getElementById('auth-delegate-status');
+  function setStatus(msg,color){if(statusEl){statusEl.textContent=msg;statusEl.style.color=color||'var(--muted)';}}
+  function resetBtn(){if(btn){btn.disabled=false;btn.innerHTML='<svg width="16" height="16" viewBox="0 0 21 21" fill="none"><rect width="10" height="10" fill="#F25022"/><rect x="11" width="10" height="10" fill="#7FBA00"/><rect y="11" width="10" height="10" fill="#00A4EF"/><rect x="11" y="11" width="10" height="10" fill="#FFB900"/></svg> Sign in with Microsoft';}}
+
+  if(btn){btn.disabled=true;btn.textContent='Loading\u2026';}
+  setStatus('Loading MSAL.js\u2026');
+
   loadMSAL(function(err){
-    if(err){if(btn){btn.disabled=false;}alert('Could not load MSAL.js: '+err.message);return;}
-    try{
-      msalInstance=new msal.PublicClientApplication({
-        auth:{clientId:clientId,authority:'https://login.microsoftonline.com/'+tenantId,
-          redirectUri:window.location.href.split('#')[0]},
-        cache:{cacheLocation:'sessionStorage',storeAuthStateInCookie:false}
+    if(err){resetBtn();setStatus('Failed to load MSAL: '+err.message,'var(--red)');return;}
+    setStatus('Initializing\u2026');
+
+    var config={
+      auth:{
+        clientId:clientId,
+        authority:'https://login.microsoftonline.com/'+tenantId,
+        redirectUri:window.location.href.split('?')[0].split('#')[0]
+      },
+      cache:{cacheLocation:'sessionStorage',storeAuthStateInCookie:false},
+      system:{loggerOptions:{logLevel:msal.LogLevel.Warning}}
+    };
+
+    var instance;
+    try{ instance=new msal.PublicClientApplication(config); }
+    catch(e){resetBtn();setStatus('MSAL init error: '+e.message,'var(--red)');return;}
+
+    // MSAL 2.x requires initialize() before any token calls
+    var initPromise=instance.initialize?instance.initialize():Promise.resolve();
+    initPromise.then(function(){
+      msalInstance=instance;
+      if(btn){btn.disabled=true;btn.textContent='Sign in\u2026';}
+      setStatus('Opening Microsoft login popup\u2026');
+
+      var loginRequest={scopes:[PBI_SCOPE,'openid','profile']};
+
+      // Skip silent — go straight to loginPopup so user always sees the login UI
+      instance.loginPopup(loginRequest).then(function(result){
+        liveToken=result.accessToken;
+        setStatus('Signed in as '+result.account.username,'var(--green)');
+        setTimeout(function(){closeSetup();loadLiveData();},400);
+      }).catch(function(e){
+        resetBtn();
+        if(e.errorCode==='user_cancelled'||e.message.indexOf('user_cancelled')>=0){
+          setStatus('Sign-in cancelled.','var(--amber)');
+        } else if(e.errorCode==='popup_window_error'||e.message.indexOf('popup')>=0){
+          setStatus('Popup blocked \u2014 trying redirect\u2026','var(--amber)');
+          sessionStorage.setItem('nexion_clientId',clientId);
+          sessionStorage.setItem('nexion_tenantId',tenantId);
+          instance.loginRedirect(loginRequest);
+        } else {
+          setStatus('Error: '+e.message,'var(--red)');
+          console.error('MSAL loginPopup error:',e);
+        }
       });
-    }catch(e){if(btn){btn.disabled=false;}alert('MSAL init error: '+e.message);return;}
-    if(btn)btn.textContent='Opening Microsoft login\u2026';
-    var loginRequest={scopes:[PBI_SCOPE,'openid','profile']};
-    msalInstance.acquireTokenSilent(loginRequest).then(function(r){
-      liveToken=r.accessToken; closeSetup(); loadLiveData();
-    }).catch(function(){
-      msalInstance.acquireTokenPopup(loginRequest).then(function(r){
-        liveToken=r.accessToken; closeSetup(); loadLiveData();
-      }).catch(function(e2){
-        if(btn){btn.disabled=false;btn.textContent='Sign in with Microsoft';}
-        if(e2.errorCode==='popup_window_error'||e2.errorCode==='user_cancelled'){
-          if(confirm('Popup was blocked or cancelled. Use redirect-based sign-in instead?')){
-            sessionStorage.setItem('nexion_clientId',clientId);
-            sessionStorage.setItem('nexion_tenantId',tenantId);
-            msalInstance.loginRedirect(loginRequest);
-          }
-        } else { alert('Sign-in error: '+e2.message); }
-      });
+    }).catch(function(e){
+      resetBtn();setStatus('MSAL initialize() failed: '+e.message,'var(--red)');
     });
   });
 }
@@ -1556,21 +1590,29 @@ function connectInteractive(){
 function handleMSALRedirect(){
   var clientId=sessionStorage.getItem('nexion_clientId');
   var tenantId=sessionStorage.getItem('nexion_tenantId')||'common';
-  if(!clientId||!window.msal)return;
-  try{
-    msalInstance=new msal.PublicClientApplication({
-      auth:{clientId:clientId,authority:'https://login.microsoftonline.com/'+tenantId,
-        redirectUri:window.location.href.split('#')[0]},
-      cache:{cacheLocation:'sessionStorage',storeAuthStateInCookie:false}
-    });
-    msalInstance.handleRedirectPromise().then(function(r){
-      if(r&&r.accessToken){
-        liveToken=r.accessToken; creds.client=clientId; creds.tenant=tenantId;
-        sessionStorage.removeItem('nexion_clientId'); sessionStorage.removeItem('nexion_tenantId');
-        loadLiveData();
-      }
-    }).catch(function(e){console.warn('MSAL redirect:',e);});
-  }catch(e){console.warn('MSAL init:',e);}
+  if(!clientId)return;
+  loadMSAL(function(err){
+    if(err||!window.msal)return;
+    try{
+      var instance=new msal.PublicClientApplication({
+        auth:{clientId:clientId,authority:'https://login.microsoftonline.com/'+tenantId,
+          redirectUri:window.location.href.split('?')[0].split('#')[0]},
+        cache:{cacheLocation:'sessionStorage',storeAuthStateInCookie:false}
+      });
+      var initP=instance.initialize?instance.initialize():Promise.resolve();
+      initP.then(function(){
+        instance.handleRedirectPromise().then(function(r){
+          if(r&&r.accessToken){
+            msalInstance=instance;
+            liveToken=r.accessToken; creds.client=clientId; creds.tenant=tenantId;
+            sessionStorage.removeItem('nexion_clientId');
+            sessionStorage.removeItem('nexion_tenantId');
+            loadLiveData();
+          }
+        }).catch(function(e){console.warn('MSAL redirect error:',e);});
+      });
+    }catch(e){console.warn('MSAL redirect init:',e);}
+  });
 }
 
 async function getFreshToken(){
@@ -1591,18 +1633,66 @@ async function getFreshToken(){
 function connectServicePrincipal(){
   creds.tenant=(document.getElementById('inp-tenant').value||'').trim();
   creds.client=(document.getElementById('inp-client').value||'').trim();
-  PROXY_BASE=(document.getElementById('inp-proxy').value||'').trim();
-  if(!creds.tenant||!creds.client||!PROXY_BASE){alert('Please fill Tenant ID, Client ID and Proxy URL.');return;}
-  closeSetup(); loadLiveDataViaProxy();
+  PROXY_BASE=(document.getElementById('inp-proxy').value||'').trim().replace(/\/+$/,'');
+  var statusEl=document.getElementById('proxy-status');
+  if(!creds.tenant||!creds.client||!PROXY_BASE){
+    if(statusEl){statusEl.textContent='Please fill in all three fields.';statusEl.style.color='var(--red)';}
+    return;
+  }
+  if(statusEl){statusEl.textContent='Connecting\u2026';statusEl.style.color='var(--muted)';}
+  // Keep modal open — loadLiveDataViaProxy will close it on success via showLiveConnected
+  loadLiveDataViaProxy();
 }
 async function loadLiveDataViaProxy(){
-  setLoadingState(true,'Authenticating via proxy\u2026');
+  setLoadingState(true,'Testing proxy connection\u2026');
+  var statusEl=document.getElementById('proxy-status');
+  function setProxyStatus(msg,color){if(statusEl){statusEl.innerHTML=msg;statusEl.style.color=color||'var(--muted)';}}
+
+  // Step 1: quick OPTIONS/GET reachability check
   try{
-    var resp=await fetch(PROXY_BASE+'/api/token',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({tenant:creds.tenant,clientId:creds.client})});
-    if(!resp.ok)throw new Error('Proxy token failed: '+resp.status);
-    var data=await resp.json(); liveToken=data.access_token;
+    // Try a preflight-safe GET first to distinguish CORS from unreachable
+    var pingResp=await Promise.race([
+      fetch(PROXY_BASE+'/api/token',{method:'OPTIONS'}),
+      new Promise(function(_,rej){setTimeout(function(){rej(new Error('timeout'));},8000);})
+    ]).catch(function(){return null;});
+
+    setLoadingState(true,'Authenticating via proxy\u2026');
+    var resp=await fetch(PROXY_BASE+'/api/token',{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({tenant:creds.tenant,clientId:creds.client})
+    });
+    if(!resp.ok){
+      var errBody='';
+      try{errBody=await resp.text();}catch(e){}
+      throw new Error('HTTP '+resp.status+(errBody?' — '+errBody.slice(0,200):''));
+    }
+    var data=await resp.json();
+    if(!data.access_token)throw new Error('Proxy returned no access_token. Check your Function code returns { access_token }.');
+    liveToken=data.access_token;
+    setProxyStatus('&#10003; Connected','var(--green)');
     await loadLiveData();
-  }catch(err){setLoadingState(false,'');showLiveError('Proxy: '+err.message);}
+  }catch(err){
+    setLoadingState(false,'');
+    var msg=err.message||String(err);
+    var hint='';
+    if(msg.indexOf('Failed to fetch')>=0||msg.indexOf('NetworkError')>=0||msg.indexOf('CORS')>=0){
+      hint='<br><br><b>This is almost always a CORS error.</b> Fix it in Azure Portal:<br>'+
+           '1. Go to your <b>Function App → CORS</b><br>'+
+           '2. Add <code style="background:var(--surface2);padding:1px 5px;border-radius:3px">'+escapeHtml(window.location.origin)+'</code> as an allowed origin<br>'+
+           '   (or <code style="background:var(--surface2);padding:1px 5px;border-radius:3px">*</code> for testing)<br>'+
+           '3. Check <b>Enable Access-Control-Allow-Credentials</b><br>'+
+           '4. Save and wait ~30 seconds, then retry.';
+    } else if(msg.indexOf('timeout')>=0){
+      hint='<br><br>The proxy URL did not respond in 8 seconds. Check the Function App URL is correct and the Function is deployed and running.';
+    } else if(msg.indexOf('404')>=0){
+      hint='<br><br>404 — the <code>/api/token</code> endpoint was not found. Make sure your Azure Function is named <b>token</b> and is deployed.';
+    } else if(msg.indexOf('401')>=0||msg.indexOf('403')>=0){
+      hint='<br><br>Auth error from proxy — check the Function App authentication settings (it should be Anonymous for this endpoint, with auth handled in code).';
+    }
+    setProxyStatus('<b>Connection failed:</b> '+escapeHtml(msg)+hint,'var(--red)');
+    showLiveError('Proxy: '+msg);
+  }
 }
 
 // ─── PBI API CALL ─────────────────────────────────────────────────────────────
@@ -1681,6 +1771,7 @@ function setLoadingState(loading,msg){
   else{if(dot)dot.style.background='var(--teal)';}
 }
 function showLiveConnected(){
+  closeSetup();  // close modal now that we're successfully connected
   var accounts=msalInstance?msalInstance.getAllAccounts():[];
   var user=accounts.length?accounts[0].username:'';
   var cs=document.getElementById('connStatus'),ct=document.getElementById('connTenant'),lbl=document.getElementById('statusLabel'),banner=document.getElementById('demo-banner');
@@ -2680,7 +2771,13 @@ function showView(name, btn){
 }
 
 // MODAL / CONFIRM
-function openSetup(){var m=document.getElementById('setupModal');if(m)m.style.display='flex';}
+function openSetup(){
+  var m=document.getElementById('setupModal');if(m)m.style.display='flex';
+  var hint=document.getElementById('cors-origin-hint');
+  // window.location.origin is reliable on https, may be 'null' for file:// — show both
+  var origin=window.location.origin;
+  if(hint)hint.textContent=(origin&&origin!=='null')?origin:window.location.href.split('/').slice(0,3).join('/');
+}
 function closeSetup(){var m=document.getElementById('setupModal');if(m)m.style.display='none';}
 function skipConnect(){
   closeSetup();
